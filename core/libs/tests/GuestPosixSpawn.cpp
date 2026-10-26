@@ -3,6 +3,7 @@
 #include "prx/libSceLibcInternal/include/Spawn.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -18,6 +19,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <fcntl.h>
+#include <unistd.h>
 extern "C" int kill(int, int);
 #endif
 
@@ -215,7 +218,7 @@ static std::filesystem::path OwnExecutablePath() {
 #endif
 }
 
-static std::int32_t SpawnChild(const char* role) {
+static std::int32_t SpawnChild(const char* role, int gate = -1) {
     const auto own = OwnExecutablePath();
     const auto target = own.parent_path() / std::filesystem::path(reinterpret_cast<const char8_t*>(("child.bin" + own.extension().string()).c_str()));
     std::error_code error;
@@ -236,6 +239,8 @@ static std::int32_t SpawnChild(const char* role) {
     for (char** entry = parentEnvironment; entry != nullptr && *entry != nullptr; ++entry)
         entries.push_back(*entry);
     entries.push_back(std::string("ANYPS5_POSIX_SPAWN_ROLE=") + role);
+    if (gate >= 0)
+        entries.push_back("ANYPS5_POSIX_SPAWN_GATE=" + std::to_string(gate));
     std::vector<char*> environment;
     for (auto& entry : entries)
         environment.push_back(entry.data());
@@ -292,15 +297,19 @@ static void CheckConcurrentWaiters() {
 
 #ifndef _WIN32
 static void CheckStoppedChild() {
-    const std::int32_t processId = SpawnChild("child-stop");
+    int gate[2];
+    Check(pipe(gate) == 0 && fcntl(gate[1], F_SETFD, FD_CLOEXEC) == 0);
+    const std::int32_t processId = SpawnChild("child-stop", gate[0]);
     int status = -1;
     Check(waitpid_nid_postfix(processId, &status, 2) == processId);
     Check((status & 0x7f) == 0x7f && (status >> 8) == 17);
     Check(kill(processId, SIGCONT) == 0);
     Check(waitpid_nid_postfix(processId, &status, 4) == processId && status == 0x13);
+    Check(write(gate[1], "x", 1) == 1);
     Check(waitpid_nid_postfix(processId, &status, 0) == processId);
     Check((status & 0x7f) == 0 && ((status >> 8) & 0xff) == 44);
     Check(waitpid_nid_postfix(processId, &status, 0) == -1 && *__error_nid_postfix() == 10);
+    Check(close(gate[0]) == 0 && close(gate[1]) == 0);
     CleanupChild();
 }
 
@@ -335,7 +344,11 @@ int main() {
 #ifndef _WIN32
         if (std::strcmp(role, "child-stop") == 0) {
             std::raise(SIGSTOP);
-            std::_Exit(44);
+            const int gate = std::atoi(std::getenv("ANYPS5_POSIX_SPAWN_GATE"));
+            char byte = 0;
+            ssize_t received = 0;
+            while ((received = read(gate, &byte, 1)) < 0 && errno == EINTR) {}
+            std::_Exit(received == 1 ? 44 : 98);
         }
         if (std::strcmp(role, "child-kill-bus") == 0) std::raise(SIGBUS);
         if (std::strcmp(role, "child-kill-sys") == 0) std::raise(SIGSYS);
